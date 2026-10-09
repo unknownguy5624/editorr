@@ -64,6 +64,18 @@ jobs:
           }
           EOF
 
+      - name: Turn off R8 minify (it breaks WorkManager at app start)
+        run: |
+          F_KTS=build_app/android/app/build.gradle.kts
+          F_GRV=build_app/android/app/build.gradle
+          if [ -f "$F_KTS" ]; then
+            sed -i 's|signingConfig = signingConfigs.getByName("debug")|&\n            isMinifyEnabled = false\n            isShrinkResources = false|' "$F_KTS"
+            grep -n -B2 -A4 "isMinifyEnabled" "$F_KTS" || { echo "PATCH FAILED: release block not found"; cat "$F_KTS"; exit 1; }
+          elif [ -f "$F_GRV" ]; then
+            sed -i 's|signingConfig signingConfigs.debug|&\n            minifyEnabled false\n            shrinkResources false|' "$F_GRV"
+            grep -n -B2 -A4 "minifyEnabled" "$F_GRV" || { echo "PATCH FAILED: release block not found"; cat "$F_GRV"; exit 1; }
+          fi
+
       - name: Build release APK
         working-directory: build_app
         run: |
@@ -100,6 +112,7 @@ jobs:
           echo "=============== CRASH LOG START ==============="
           grep -n -i -E "FATAL|AndroidRuntime|UnsatisfiedLink|Fatal signal|E/flutter|MobileAds|ffmpeg|quickcut" emu_log.txt | head -120
           echo "=============== CRASH LOG END ==============="
+          if grep -q "FATAL EXCEPTION" emu_log.txt; then echo "RESULT: APP CRASHED"; else echo "RESULT: NO CRASH - APP STARTED OK"; fi
           EOF
 
       - name: Launch app on virtual phone and print crash log
