@@ -1,0 +1,55 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Find project folder
+        id: find
+        run: |
+          P=$(find . -name pubspec.yaml -not -path "./build_app/*" | head -n 1)
+          echo "pubspec found at: '$P'"
+          if [ -z "$P" ]; then
+            echo "No pubspec.yaml in the repo. Files were not uploaded correctly."
+            ls -R | head -50
+            exit 1
+          fi
+          echo "src=$(dirname "$P")" >> "$GITHUB_OUTPUT"
+
+      - name: Create Android scaffold and copy QuickCut code in
+        run: |
+          SRC="${{ steps.find.outputs.src }}"
+          flutter create --platforms=android --project-name quickcut --org com.quickcut build_app
+          rm -rf build_app/lib build_app/test
+          cp -r "$SRC/lib" build_app/lib
+          cp -r "$SRC/assets" build_app/assets
+          cp "$SRC/pubspec.yaml" build_app/pubspec.yaml
+          python3 "$SRC/tools/patch_android.py" build_app
+
+      - name: Build release APK
+        working-directory: build_app
+        run: |
+          flutter pub get
+          flutter build apk --release --split-per-abi --no-shrink
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quickcut-apk
+          path: build_app/build/app/outputs/flutter-apk/*.apk
