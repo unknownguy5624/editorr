@@ -43,6 +43,27 @@ jobs:
           cp "$SRC/pubspec.yaml" build_app/pubspec.yaml
           python3 "$SRC/tools/patch_android.py" build_app
 
+      - name: Force compileSdk 36 for all plugins
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/force-compilesdk.gradle << 'EOF'
+          gradle.beforeProject { p ->
+            p.afterEvaluate {
+              def ext = p.extensions.findByName('android')
+              if (ext != null) {
+                try {
+                  def cur = ext.compileSdk
+                  if (cur == null || cur < 36) {
+                    ext.compileSdk = 36
+                  }
+                } catch (Throwable t) {
+                  println "compileSdk override skipped for " + p.name
+                }
+              }
+            }
+          }
+          EOF
+
       - name: Build release APK
         working-directory: build_app
         run: |
