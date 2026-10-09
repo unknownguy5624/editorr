@@ -74,3 +74,49 @@ jobs:
         with:
           name: quickcut-apk
           path: build_app/build/app/outputs/flutter-apk/*.apk
+
+      # ---- Diagnostic: launch the app on a virtual phone and print the crash log ----
+      - name: Enable KVM (needed for the virtual phone)
+        continue-on-error: true
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build x86 test APK for the virtual phone
+        continue-on-error: true
+        working-directory: build_app
+        run: flutter build apk --release --target-platform android-x64 --no-shrink
+
+      - name: Write emulator test script
+        continue-on-error: true
+        run: |
+          cat > emu_test.sh << 'EOF'
+          adb install -r build_app/build/app/outputs/flutter-apk/app-release.apk
+          adb logcat -c
+          adb shell monkey -p com.quickcut.quickcut -c android.intent.category.LAUNCHER 1
+          sleep 20
+          adb logcat -d > emu_log.txt
+          echo "=============== CRASH LOG START ==============="
+          grep -n -i -E "FATAL|AndroidRuntime|UnsatisfiedLink|Fatal signal|E/flutter|MobileAds|ffmpeg|quickcut" emu_log.txt | head -120
+          echo "=============== CRASH LOG END ==============="
+          EOF
+
+      - name: Launch app on virtual phone and print crash log
+        continue-on-error: true
+        timeout-minutes: 20
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash emu_test.sh
+
+      - name: Save full log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-log
+          path: emu_log.txt
