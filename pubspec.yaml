@@ -1,0 +1,25 @@
+name: quickcut
+description: QuickCut - a lite mobile video editor.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  video_player: ^2.9.0
+  image_picker: ^1.1.2
+  file_picker: ^8.1.2
+  path_provider: ^2.1.4
+  shared_preferences: ^2.3.2
+  gal: ^2.3.0
+  share_plus: ^10.0.0
+  google_mobile_ads: ^9.0.0
+  ffmpeg_kit_flutter_new: ^4.1.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/fonts/text_font.ttf
