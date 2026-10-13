@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/ad_service.dart';
@@ -9,8 +10,9 @@ import '../services/edit_settings.dart';
 import '../services/export_service.dart';
 import '../services/project_store.dart';
 import 'export_screen.dart';
+import 'trim_bar.dart';
 
-enum Tool { trim, speed, filters, text, music }
+enum Tool { trim, speed, filters, text, overlay, music }
 
 class EditorScreen extends StatefulWidget {
   final String videoPath;
@@ -30,6 +32,8 @@ class _EditorScreenState extends State<EditorScreen> {
   Tool _tool = Tool.trim;
   bool _exporting = false;
   double _progress = 0;
+  List<String> _thumbs = [];
+  double _baseSize = 0.3; // size at the start of a pinch gesture
 
   @override
   void initState() {
@@ -41,8 +45,12 @@ class _EditorScreenState extends State<EditorScreen> {
       _duration = _c.value.duration.inMilliseconds / 1000.0;
       s.start = 0;
       s.end = _duration;
+      s.videoHeight = _c.value.size.height;
       _c.addListener(_onTick);
       setState(() => _ready = true);
+      ExportService.thumbnails(widget.videoPath, _duration).then((t) {
+        if (mounted) setState(() => _thumbs = t);
+      });
     });
   }
 
@@ -97,8 +105,22 @@ class _EditorScreenState extends State<EditorScreen> {
     });
   }
 
+  Future<void> _pickOverlay() async {
+    if (s.overlays.length >= 3) return;
+    final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+    if (picked == null) return;
+    setState(() {
+      final item = OverlayItem(picked.path);
+      // Stagger new overlays so they don't sit exactly on top of each other.
+      item.fx = 0.5 + 0.08 * s.overlays.length;
+      item.fy = 0.35 + 0.08 * s.overlays.length;
+      s.overlays.add(item);
+    });
+  }
+
   Future<void> _export() async {
     await _c.pause();
+    if (!mounted) return;
     FocusScope.of(context).unfocus();
     setState(() {
       _exporting = true;
@@ -197,59 +219,111 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   Widget _buildPreview() {
-    final alignment = switch (s.textPos) {
-      TextPos.top => const Alignment(0, -0.84),
-      TextPos.middle => Alignment.center,
-      TextPos.bottom => const Alignment(0, 0.84),
-    };
-
     return Center(
-      child: GestureDetector(
-        onTap: _togglePlay,
-        child: AspectRatio(
-          aspectRatio: _c.value.aspectRatio,
-          child: LayoutBuilder(
-            builder: (context, box) {
-              final fontSize = box.maxHeight / kTextDivisors[s.textSizeIndex];
-              return Stack(
+      child: AspectRatio(
+        aspectRatio: _c.value.aspectRatio,
+        child: LayoutBuilder(
+          builder: (context, box) {
+            final w = box.maxWidth;
+            final h = box.maxHeight;
+            final fontSize = h * s.textSize;
+
+            return ClipRect(
+              child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  ColorFiltered(
-                    colorFilter: ColorFilter.matrix(s.filter.matrix),
-                    child: VideoPlayer(_c),
+                  GestureDetector(
+                    onTap: _togglePlay,
+                    child: ColorFiltered(
+                      colorFilter: ColorFilter.matrix(s.filter.matrix),
+                      child: VideoPlayer(_c),
+                    ),
                   ),
-                  if (s.hasText)
-                    Align(
-                      alignment: alignment,
-                      child: Container(
-                        padding: EdgeInsets.symmetric(
-                          horizontal: fontSize * 0.4,
-                          vertical: fontSize * 0.25,
+                  if (!_c.value.isPlaying)
+                    const IgnorePointer(
+                      child: Center(
+                        child: Icon(
+                          Icons.play_circle_fill,
+                          size: 64,
+                          color: Colors.white70,
                         ),
-                        color: const Color(0x73000000),
-                        child: Text(
-                          s.text.trim(),
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: fontSize,
-                            fontWeight: FontWeight.bold,
-                            color: kTextColors[s.textColorIndex].color,
+                      ),
+                    ),
+
+                  // ---- image overlays (drag to move, pinch to resize) ----
+                  for (final o in s.overlays)
+                    Positioned(
+                      left: o.fx * w,
+                      top: o.fy * h,
+                      child: FractionalTranslation(
+                        translation: const Offset(-0.5, -0.5),
+                        child: GestureDetector(
+                          onScaleStart: (_) => _baseSize = o.widthFrac,
+                          onScaleUpdate: (d) {
+                            setState(() {
+                              o.fx = (o.fx + d.focalPointDelta.dx / w)
+                                  .clamp(0.0, 1.0);
+                              o.fy = (o.fy + d.focalPointDelta.dy / h)
+                                  .clamp(0.0, 1.0);
+                              if (d.scale != 1.0) {
+                                o.widthFrac =
+                                    (_baseSize * d.scale).clamp(0.08, 1.0);
+                              }
+                            });
+                          },
+                          child: Image.file(
+                            File(o.path),
+                            width: w * o.widthFrac,
+                            fit: BoxFit.contain,
                           ),
                         ),
                       ),
                     ),
-                  if (!_c.value.isPlaying)
-                    const Center(
-                      child: Icon(
-                        Icons.play_circle_fill,
-                        size: 64,
-                        color: Colors.white70,
+
+                  // ---- text (drag to move, pinch to resize) ----
+                  if (s.hasText)
+                    Positioned(
+                      left: s.textX * w,
+                      top: s.textY * h,
+                      child: FractionalTranslation(
+                        translation: const Offset(-0.5, -0.5),
+                        child: GestureDetector(
+                          onScaleStart: (_) => _baseSize = s.textSize,
+                          onScaleUpdate: (d) {
+                            setState(() {
+                              s.textX = (s.textX + d.focalPointDelta.dx / w)
+                                  .clamp(0.0, 1.0);
+                              s.textY = (s.textY + d.focalPointDelta.dy / h)
+                                  .clamp(0.0, 1.0);
+                              if (d.scale != 1.0) {
+                                s.textSize =
+                                    (_baseSize * d.scale).clamp(0.02, 0.2);
+                              }
+                            });
+                          },
+                          child: Container(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: fontSize * 0.3,
+                              vertical: fontSize * 0.15,
+                            ),
+                            color: const Color(0x73000000),
+                            child: Text(
+                              s.text.trim(),
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: fontSize,
+                                fontWeight: FontWeight.bold,
+                                color: kTextColors[s.textColorIndex].color,
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                 ],
-              );
-            },
-          ),
+              ),
+            );
+          },
         ),
       ),
     );
@@ -282,9 +356,8 @@ class _EditorScreenState extends State<EditorScreen> {
   Widget _buildToolBar() {
     Widget item(Tool t, IconData icon, String label) {
       final active = _tool == t;
-      final color = active
-          ? Theme.of(context).colorScheme.primary
-          : Colors.white60;
+      final color =
+          active ? Theme.of(context).colorScheme.primary : Colors.white60;
       return Expanded(
         child: InkWell(
           onTap: () => setState(() => _tool = t),
@@ -295,7 +368,7 @@ class _EditorScreenState extends State<EditorScreen> {
               children: [
                 Icon(icon, color: color),
                 const SizedBox(height: 2),
-                Text(label, style: TextStyle(color: color, fontSize: 12)),
+                Text(label, style: TextStyle(color: color, fontSize: 11)),
               ],
             ),
           ),
@@ -311,6 +384,7 @@ class _EditorScreenState extends State<EditorScreen> {
           item(Tool.speed, Icons.speed, 'Speed'),
           item(Tool.filters, Icons.auto_awesome, 'Filters'),
           item(Tool.text, Icons.title, 'Text'),
+          item(Tool.overlay, Icons.layers, 'Overlay'),
           item(Tool.music, Icons.music_note, 'Music'),
         ],
       ),
@@ -327,29 +401,33 @@ class _EditorScreenState extends State<EditorScreen> {
         return _filterPanel();
       case Tool.text:
         return _textPanel();
+      case Tool.overlay:
+        return _overlayPanel();
       case Tool.music:
         return _musicPanel();
     }
   }
 
   Widget _trimPanel() {
+    final pos = _c.value.position.inMilliseconds / 1000.0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Text('Trim', style: TextStyle(fontWeight: FontWeight.w700)),
-        RangeSlider(
-          values: RangeValues(s.start, s.end),
-          min: 0,
-          max: _duration <= 0 ? 1 : _duration,
-          onChanged: (v) {
-            if (v.end - v.start < 0.5) return;
-            setState(() {
-              s.start = v.start;
-              s.end = v.end;
-            });
-          },
-          onChangeEnd: (_) => _seekTo(s.start),
+        const SizedBox(height: 10),
+        TrimBar(
+          thumbs: _thumbs,
+          duration: _duration,
+          start: s.start,
+          end: s.end,
+          position: pos,
+          onChanged: (a, b) => setState(() {
+            s.start = a;
+            s.end = b;
+          }),
+          onChangeEnd: () => _seekTo(s.start),
         ),
+        const SizedBox(height: 8),
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
@@ -423,15 +501,10 @@ class _EditorScreenState extends State<EditorScreen> {
           ),
           onChanged: (v) => setState(() => s.text = v),
         ),
-        const SizedBox(height: 10),
-        SegmentedButton<TextPos>(
-          segments: const [
-            ButtonSegment(value: TextPos.top, label: Text('Top')),
-            ButtonSegment(value: TextPos.middle, label: Text('Middle')),
-            ButtonSegment(value: TextPos.bottom, label: Text('Bottom')),
-          ],
-          selected: {s.textPos},
-          onSelectionChanged: (v) => setState(() => s.textPos = v.first),
+        const SizedBox(height: 6),
+        const Text(
+          'Drag the text on the video to move it. Pinch to resize.',
+          style: TextStyle(color: Colors.white54, fontSize: 12),
         ),
         const SizedBox(height: 10),
         Row(
@@ -461,12 +534,63 @@ class _EditorScreenState extends State<EditorScreen> {
                 padding: const EdgeInsets.only(left: 6),
                 child: ChoiceChip(
                   label: Text(kTextSizeLabels[i]),
-                  selected: s.textSizeIndex == i,
-                  onSelected: (_) => setState(() => s.textSizeIndex = i),
+                  selected: (s.textSize - kTextSizes[i]).abs() < 0.011,
+                  onSelected: (_) => setState(() => s.textSize = kTextSizes[i]),
                 ),
               ),
           ],
         ),
+      ],
+    );
+  }
+
+  Widget _overlayPanel() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Overlay', style: TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            FilledButton.tonalIcon(
+              onPressed: s.overlays.length >= 3 ? null : _pickOverlay,
+              icon: const Icon(Icons.add_photo_alternate_outlined),
+              label: const Text('Add image'),
+            ),
+            const SizedBox(width: 10),
+            Text(
+              '${s.overlays.length}/3',
+              style: const TextStyle(color: Colors.white54),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          'Drag an image on the video to move it. Pinch to resize. '
+          'PNG images with a transparent background work best.',
+          style: TextStyle(color: Colors.white54, fontSize: 12),
+        ),
+        const SizedBox(height: 8),
+        for (var i = 0; i < s.overlays.length; i++)
+          Row(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: Image.file(
+                  File(s.overlays[i].path),
+                  width: 36,
+                  height: 36,
+                  fit: BoxFit.cover,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(child: Text('Image ${i + 1}')),
+              IconButton(
+                onPressed: () => setState(() => s.overlays.removeAt(i)),
+                icon: const Icon(Icons.delete_outline),
+              ),
+            ],
+          ),
       ],
     );
   }

@@ -28,14 +28,47 @@ class ExportService {
     return f.path;
   }
 
-  static String _yExpr(TextPos p) {
-    switch (p) {
-      case TextPos.top:
-        return 'h*0.08';
-      case TextPos.middle:
-        return '(h-text_h)/2';
-      case TextPos.bottom:
-        return 'h*0.82-text_h';
+  /// Grabs [count] evenly spaced frames for the trim bar.
+  static Future<List<String>> thumbnails(
+    String input,
+    double duration, {
+    int count = 8,
+  }) async {
+    try {
+      if (duration <= 0) return [];
+      final tmp = await getTemporaryDirectory();
+      final dir = Directory(
+        '${tmp.path}/thumbs_${DateTime.now().millisecondsSinceEpoch}',
+      );
+      await dir.create(recursive: true);
+
+      final rate = (count / duration).toStringAsFixed(5);
+      final done = Completer<void>();
+      await FFmpegKit.executeWithArgumentsAsync(
+        [
+          '-y',
+          '-i', input,
+          '-vf', 'fps=$rate,scale=-2:120',
+          '-frames:v', '$count',
+          '-q:v', '5',
+          '${dir.path}/t%02d.jpg',
+        ],
+        (session) async {
+          if (!done.isCompleted) done.complete();
+        },
+      );
+      await done.future;
+
+      final files = dir
+          .listSync()
+          .whereType<File>()
+          .map((f) => f.path)
+          .where((p) => p.endsWith('.jpg'))
+          .toList()
+        ..sort();
+      return files;
+    } catch (_) {
+      return [];
     }
   }
 
@@ -54,30 +87,12 @@ class ExportService {
       final stamp = DateTime.now().millisecondsSinceEpoch;
       final outPath = '${outDir.path}/quickcut_$stamp.mp4';
 
-      // ---- video filter chain ----
-      final vf = <String>[];
-      if (s.speed != 1.0) vf.add('setpts=PTS/${s.speed}');
-      if (s.filter.ffmpeg != null) vf.add(s.filter.ffmpeg!);
-      if (s.hasText) {
-        final font = await _fontPath();
-        final textFile = File('${tmp.path}/text_$stamp.txt');
-        await textFile.writeAsString(s.text.trim());
-        final color = kTextColors[s.textColorIndex].hex;
-        final div = kTextDivisors[s.textSizeIndex].toInt();
-        vf.add(
-          'drawtext=fontfile=${font}:textfile=${textFile.path}:expansion=none'
-          ':fontcolor=0x$color:fontsize=h/$div'
-          ':x=(w-text_w)/2:y=${_yExpr(s.textPos)}'
-          ':box=1:boxcolor=0x000000@0.45:boxborderw=14',
-        );
-      }
-      // H.264 needs even dimensions.
-      vf.add('scale=trunc(iw/2)*2:trunc(ih/2)*2');
-
       final hasMusic = s.musicPath != null;
+      final overlays = s.overlays;
       final duration = s.end - s.start;
+      final outSeconds = s.outputSeconds;
 
-      // ---- arguments ----
+      // ---- inputs ----
       final args = <String>[
         '-y',
         '-hide_banner',
@@ -85,18 +100,75 @@ class ExportService {
         '-t', duration.toStringAsFixed(3),
         '-i', inputPath,
       ];
-
+      for (final o in overlays) {
+        args.addAll(['-loop', '1', '-i', o.path]);
+      }
+      final musicIndex = 1 + overlays.length;
       if (hasMusic) {
         args.addAll(['-stream_loop', '-1', '-i', s.musicPath!]);
-        args.addAll(['-map', '0:v:0', '-map', '1:a:0']);
+      }
+
+      // ---- video graph ----
+      final pre = <String>[];
+      if (s.speed != 1.0) pre.add('setpts=PTS/${s.speed}');
+      if (s.filter.ffmpeg != null) pre.add(s.filter.ffmpeg!);
+
+      final g = <String>[];
+      g.add('[0:v]${pre.isEmpty ? 'null' : pre.join(',')}[b0]');
+      var last = 'b0';
+
+      for (var k = 0; k < overlays.length; k++) {
+        final o = overlays[k];
+        final idx = k + 1;
+        final wf = o.widthFrac.toStringAsFixed(4);
+        final fx = o.fx.toStringAsFixed(4);
+        final fy = o.fy.toStringAsFixed(4);
+        g.add('[$idx:v]format=rgba[o$k]');
+        g.add(
+          '[o$k][$last]scale2ref=w=trunc(main_w*$wf/2)*2:h=trunc(ow/a/2)*2'
+          '[os$k][r$k]',
+        );
+        g.add(
+          '[r$k][os$k]overlay=x=W*$fx-w/2:y=H*$fy-h/2:shortest=1[b${k + 1}]',
+        );
+        last = 'b${k + 1}';
+      }
+
+      if (s.hasText) {
+        final font = await _fontPath();
+        final textFile = File('${tmp.path}/text_$stamp.txt');
+        await textFile.writeAsString(s.text.trim());
+        final color = kTextColors[s.textColorIndex].hex;
+        final size = s.textSize.toStringAsFixed(4);
+        final tx = s.textX.toStringAsFixed(4);
+        final ty = s.textY.toStringAsFixed(4);
+        var border = (s.videoHeight * 0.012).round();
+        if (border < 6) border = 6;
+        g.add(
+          '[$last]drawtext=fontfile=$font:textfile=${textFile.path}'
+          ':expansion=none:fontcolor=0x$color:fontsize=h*$size'
+          ':x=w*$tx-text_w/2:y=h*$ty-text_h/2'
+          ':box=1:boxcolor=0x000000@0.45:boxborderw=$border[bt]',
+        );
+        last = 'bt';
+      }
+
+      // H.264 needs even dimensions.
+      g.add('[$last]scale=trunc(iw/2)*2:trunc(ih/2)*2[vout]');
+
+      args.addAll(['-filter_complex', g.join(';')]);
+      args.addAll(['-map', '[vout]']);
+
+      // ---- audio ----
+      if (hasMusic) {
+        args.addAll(['-map', '$musicIndex:a:0']);
         args.addAll(['-af', 'volume=${s.musicVolume.toStringAsFixed(2)}']);
       } else {
-        args.addAll(['-map', '0:v:0', '-map', '0:a?']);
+        args.addAll(['-map', '0:a?']);
         if (s.speed != 1.0) args.addAll(['-af', 'atempo=${s.speed}']);
       }
 
       args.addAll([
-        '-vf', vf.join(','),
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-crf', '23',
@@ -104,12 +176,12 @@ class ExportService {
         '-c:a', 'aac',
         '-b:a', '128k',
         '-movflags', '+faststart',
+        '-t', outSeconds.toStringAsFixed(3),
+        outPath,
       ]);
-      if (hasMusic) args.add('-shortest');
-      args.add(outPath);
 
       // ---- run ----
-      final outMs = s.outputSeconds * 1000;
+      final outMs = outSeconds * 1000;
       final done = Completer<ExportResult>();
 
       await FFmpegKit.executeWithArgumentsAsync(
@@ -123,8 +195,10 @@ class ExportService {
           } else {
             final logs = await session.getAllLogsAsString() ?? '';
             final tail =
-                logs.length > 600 ? logs.substring(logs.length - 600) : logs;
-            done.complete(ExportResult.fail(tail.isEmpty ? 'Export failed' : tail));
+                logs.length > 700 ? logs.substring(logs.length - 700) : logs;
+            done.complete(
+              ExportResult.fail(tail.isEmpty ? 'Export failed' : tail),
+            );
           }
         },
         null,

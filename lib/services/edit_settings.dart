@@ -88,8 +88,6 @@ const List<FilterPreset> kFilters = [
   ),
 ];
 
-enum TextPos { top, middle, bottom }
-
 class TextColorOption {
   final Color color;
   final String hex; // RRGGBB, used by ffmpeg
@@ -104,11 +102,21 @@ const List<TextColorOption> kTextColors = [
   TextColorOption(Color(0xFF69F0AE), '69F0AE'),
 ];
 
-/// Font size = video height / divisor. Smaller divisor = bigger text.
-const List<double> kTextDivisors = [24, 16, 10];
+/// Text size presets, as a fraction of the video height.
+const List<double> kTextSizes = [0.04, 0.06, 0.10];
 const List<String> kTextSizeLabels = ['S', 'M', 'L'];
 
 const List<double> kSpeeds = [0.5, 1.0, 1.5, 2.0];
+
+/// An image placed on top of the video. Position is the CENTRE of the
+/// image as a fraction of the video (0..1); width is a fraction of video width.
+class OverlayItem {
+  final String path;
+  double fx = 0.5;
+  double fy = 0.5;
+  double widthFrac = 0.3;
+  OverlayItem(this.path);
+}
 
 /// Everything the user has chosen in the editor.
 class EditSettings {
@@ -116,11 +124,15 @@ class EditSettings {
   double end = 0; // seconds
   double speed = 1.0;
   FilterPreset filter = kFilters.first;
+  double videoHeight = 1080; // pixels, used to size the text box
 
   String text = '';
-  TextPos textPos = TextPos.bottom;
+  double textX = 0.5; // centre, fraction of video width
+  double textY = 0.82; // centre, fraction of video height
+  double textSize = 0.06; // fraction of video height
   int textColorIndex = 0;
-  int textSizeIndex = 1;
+
+  final List<OverlayItem> overlays = [];
 
   String? musicPath;
   String? musicName;
