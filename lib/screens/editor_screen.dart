@@ -12,7 +12,7 @@ import '../services/project_store.dart';
 import 'export_screen.dart';
 import 'trim_bar.dart';
 
-enum Tool { trim, speed, filters, text, overlay, music }
+enum Tool { clip, trim, speed, filters, text, overlay, music }
 
 class EditorScreen extends StatefulWidget {
   final String videoPath;
@@ -23,66 +23,197 @@ class EditorScreen extends StatefulWidget {
 }
 
 class _EditorScreenState extends State<EditorScreen> {
-  late final VideoPlayerController _c;
   final EditSettings s = EditSettings();
   final TextEditingController _textCtrl = TextEditingController();
 
-  bool _ready = false;
-  double _duration = 0; // seconds
-  Tool _tool = Tool.trim;
+  VideoPlayerController? _c;
+  bool _ready = false; // current clip is loaded in the player
+  int _sel = 0; // selected clip index
+  int _loadToken = 0;
+  Tool _tool = Tool.clip;
   bool _exporting = false;
   double _progress = 0;
-  List<String> _thumbs = [];
   double _baseSize = 0.3; // size at the start of a pinch gesture
+  bool _failedToLoad = false;
+
+  ClipItem get _clip => s.clips[_sel];
 
   @override
   void initState() {
     super.initState();
     AdService.loadInterstitial();
-    _c = VideoPlayerController.file(File(widget.videoPath));
-    _c.initialize().then((_) {
-      if (!mounted) return;
-      _duration = _c.value.duration.inMilliseconds / 1000.0;
-      s.start = 0;
-      s.end = _duration;
-      s.videoHeight = _c.value.size.height;
-      _c.addListener(_onTick);
-      setState(() => _ready = true);
-      ExportService.thumbnails(widget.videoPath, _duration).then((t) {
-        if (mounted) setState(() => _thumbs = t);
-      });
-    });
+    _boot();
+  }
+
+  Future<void> _boot() async {
+    final clip = await _makeClip(widget.videoPath);
+    if (!mounted) return;
+    if (clip == null) {
+      setState(() => _failedToLoad = true);
+      return;
+    }
+    s.clips.add(clip);
+    _loadThumbs(clip);
+    await _openClip(0);
   }
 
   @override
   void dispose() {
-    _c.removeListener(_onTick);
-    _c.dispose();
+    _loadToken++;
+    _c?.removeListener(_onTick);
+    _c?.dispose();
     _textCtrl.dispose();
     super.dispose();
   }
 
-  // Keep playback inside the trimmed range.
+  // ------------------------------------------------------------ clips
+
+  Future<ClipItem?> _makeClip(String path) async {
+    final tmp = VideoPlayerController.file(File(path));
+    try {
+      await tmp.initialize();
+      final d = tmp.value.duration.inMilliseconds / 1000.0;
+      final size = tmp.value.size;
+      if (d <= 0) return null;
+      return ClipItem(
+        path: path,
+        duration: d,
+        width: size.width,
+        height: size.height,
+      );
+    } catch (_) {
+      return null;
+    } finally {
+      await tmp.dispose();
+    }
+  }
+
+  void _loadThumbs(ClipItem c) {
+    ExportService.thumbnails(c.path, c.duration).then((t) {
+      c.thumbs = t;
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// Loads clip [i] into the preview player.
+  Future<void> _openClip(int i) async {
+    final token = ++_loadToken;
+    final old = _c;
+    old?.removeListener(_onTick);
+    _c = null;
+    if (mounted) {
+      setState(() {
+        _sel = i;
+        _ready = false;
+      });
+    }
+    await old?.dispose();
+
+    final clip = s.clips[i];
+    final c = VideoPlayerController.file(File(clip.path));
+    try {
+      await c.initialize();
+    } catch (_) {
+      await c.dispose();
+      return;
+    }
+    if (token != _loadToken || !mounted) {
+      await c.dispose();
+      return;
+    }
+    await c.setPlaybackSpeed(clip.speed);
+    await c.seekTo(Duration(milliseconds: (clip.start * 1000).round()));
+    c.addListener(_onTick);
+    _c = c;
+    setState(() => _ready = true);
+  }
+
+  Future<void> _addClip() async {
+    final picked = await ImagePicker().pickVideo(source: ImageSource.gallery);
+    if (picked == null || !mounted) return;
+    final clip = await _makeClip(picked.path);
+    if (!mounted) return;
+    if (clip == null) {
+      _toast('Could not open that video');
+      return;
+    }
+    s.clips.add(clip);
+    _loadThumbs(clip);
+    await _openClip(s.clips.length - 1);
+  }
+
+  void _splitClip() {
+    final c = _clip;
+    final p = _pos;
+    if (p <= c.start + 0.3 || p >= c.end - 0.3) {
+      _toast('Move the playhead into the middle of the clip first');
+      return;
+    }
+    final second = c.copy();
+    second.start = p;
+    second.end = c.end;
+    setState(() {
+      c.end = p;
+      s.clips.insert(_sel + 1, second);
+    });
+    _toast('Split done');
+  }
+
+  Future<void> _deleteClip() async {
+    if (s.clips.length <= 1) {
+      _toast('A project needs at least one clip');
+      return;
+    }
+    final removeAt = _sel;
+    final newSel = removeAt > 0 ? removeAt - 1 : 0;
+    s.clips.removeAt(removeAt);
+    await _openClip(newSel);
+  }
+
+  void _moveClip(int dir) {
+    final to = _sel + dir;
+    if (to < 0 || to >= s.clips.length) return;
+    setState(() {
+      final c = s.clips.removeAt(_sel);
+      s.clips.insert(to, c);
+      _sel = to;
+    });
+  }
+
+  // --------------------------------------------------------- playback
+
+  double get _pos {
+    final c = _c;
+    if (c == null || !c.value.isInitialized) {
+      return s.clips.isEmpty ? 0 : _clip.start;
+    }
+    return c.value.position.inMilliseconds / 1000.0;
+  }
+
+  // Keep playback inside the trimmed range of the selected clip.
   void _onTick() {
-    if (!_c.value.isInitialized || _exporting) return;
-    final pos = _c.value.position.inMilliseconds / 1000.0;
-    if (_c.value.isPlaying && pos >= s.end) {
-      _seekTo(s.start);
+    final c = _c;
+    if (c == null || !c.value.isInitialized || _exporting) return;
+    final pos = c.value.position.inMilliseconds / 1000.0;
+    if (c.value.isPlaying && pos >= _clip.end) {
+      _seekTo(_clip.start);
     }
     if (mounted) setState(() {});
   }
 
   void _seekTo(double seconds) {
-    _c.seekTo(Duration(milliseconds: (seconds * 1000).round()));
+    _c?.seekTo(Duration(milliseconds: (seconds * 1000).round()));
   }
 
   void _togglePlay() {
-    if (_c.value.isPlaying) {
-      _c.pause();
+    final c = _c;
+    if (c == null) return;
+    if (c.value.isPlaying) {
+      c.pause();
     } else {
-      final pos = _c.value.position.inMilliseconds / 1000.0;
-      if (pos < s.start || pos >= s.end) _seekTo(s.start);
-      _c.play();
+      final pos = _pos;
+      if (pos < _clip.start || pos >= _clip.end) _seekTo(_clip.start);
+      c.play();
     }
     setState(() {});
   }
@@ -93,6 +224,15 @@ class _EditorScreenState extends State<EditorScreen> {
     final sec = total % 60;
     return '${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}';
   }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  // ------------------------------------------------------- pickers
 
   Future<void> _pickMusic() async {
     final result = await FilePicker.platform.pickFiles(type: FileType.audio);
@@ -111,15 +251,16 @@ class _EditorScreenState extends State<EditorScreen> {
     if (picked == null) return;
     setState(() {
       final item = OverlayItem(picked.path);
-      // Stagger new overlays so they don't sit exactly on top of each other.
       item.fx = 0.5 + 0.08 * s.overlays.length;
       item.fy = 0.35 + 0.08 * s.overlays.length;
       s.overlays.add(item);
     });
   }
 
+  // --------------------------------------------------------- export
+
   Future<void> _export() async {
-    await _c.pause();
+    await _c?.pause();
     if (!mounted) return;
     FocusScope.of(context).unfocus();
     setState(() {
@@ -128,7 +269,6 @@ class _EditorScreenState extends State<EditorScreen> {
     });
 
     final result = await ExportService.export(
-      inputPath: widget.videoPath,
       s: s,
       onProgress: (p) {
         if (mounted) setState(() => _progress = p);
@@ -173,6 +313,7 @@ class _EditorScreenState extends State<EditorScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final loaded = s.clips.isNotEmpty;
     return PopScope(
       canPop: !_exporting,
       child: Scaffold(
@@ -182,7 +323,7 @@ class _EditorScreenState extends State<EditorScreen> {
             Padding(
               padding: const EdgeInsets.only(right: 12),
               child: FilledButton(
-                onPressed: (_ready && !_exporting) ? _export : null,
+                onPressed: (loaded && _ready && !_exporting) ? _export : null,
                 child: const Text('Export'),
               ),
             ),
@@ -191,15 +332,22 @@ class _EditorScreenState extends State<EditorScreen> {
         body: SafeArea(
           child: Stack(
             children: [
-              if (!_ready)
+              if (_failedToLoad)
+                const Center(child: Text('Could not open this video'))
+              else if (!loaded)
                 const Center(child: CircularProgressIndicator())
               else
                 Column(
                   children: [
-                    Expanded(child: _buildPreview()),
+                    Expanded(
+                      child: _ready
+                          ? _buildPreview()
+                          : const Center(child: CircularProgressIndicator()),
+                    ),
                     _buildTransport(),
+                    _buildTimeline(),
                     SizedBox(
-                      height: 210,
+                      height: 190,
                       child: Container(
                         width: double.infinity,
                         color: const Color(0xFF14141B),
@@ -219,9 +367,10 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   Widget _buildPreview() {
+    final c = _c!;
     return Center(
       child: AspectRatio(
-        aspectRatio: _c.value.aspectRatio,
+        aspectRatio: c.value.aspectRatio,
         child: LayoutBuilder(
           builder: (context, box) {
             final w = box.maxWidth;
@@ -236,10 +385,10 @@ class _EditorScreenState extends State<EditorScreen> {
                     onTap: _togglePlay,
                     child: ColorFiltered(
                       colorFilter: ColorFilter.matrix(s.filter.matrix),
-                      child: VideoPlayer(_c),
+                      child: VideoPlayer(c),
                     ),
                   ),
-                  if (!_c.value.isPlaying)
+                  if (!c.value.isPlaying)
                     const IgnorePointer(
                       child: Center(
                         child: Icon(
@@ -330,25 +479,102 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   Widget _buildTransport() {
-    final pos = _c.value.position.inMilliseconds / 1000.0;
+    final playing = _c?.value.isPlaying ?? false;
+    final inClip = (_pos - _clip.start).clamp(0.0, _clip.duration);
+    final clipLen = _clip.end - _clip.start;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       child: Row(
         children: [
           IconButton(
-            onPressed: _togglePlay,
-            icon: Icon(_c.value.isPlaying ? Icons.pause : Icons.play_arrow),
+            onPressed: _ready ? _togglePlay : null,
+            icon: Icon(playing ? Icons.pause : Icons.play_arrow),
           ),
           Text(
-            '${_fmt(pos)} / ${_fmt(_duration)}',
+            '${_fmt(inClip)} / ${_fmt(clipLen)}',
             style: const TextStyle(color: Colors.white70),
           ),
           const Spacer(),
           Text(
-            'Output ${_fmt(s.outputSeconds)}',
-            style: const TextStyle(color: Colors.white54, fontSize: 12),
+            'Total ${_fmt(s.outputSeconds)}  |  Preview plays one clip',
+            style: const TextStyle(color: Colors.white54, fontSize: 11),
           ),
         ],
+      ),
+    );
+  }
+
+  /// The clip strip: tap a clip to select it, "+" adds another.
+  Widget _buildTimeline() {
+    return SizedBox(
+      height: 76,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        children: [
+          for (var i = 0; i < s.clips.length; i++) _clipBlock(i),
+          InkWell(
+            onTap: _exporting ? null : _addClip,
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              width: 56,
+              margin: const EdgeInsets.only(left: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E1E28),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.add, color: Colors.white70),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _clipBlock(int i) {
+    final c = s.clips[i];
+    final selected = i == _sel;
+    final width = (c.outSeconds * 22).clamp(70.0, 260.0);
+    return GestureDetector(
+      onTap: () {
+        if (i != _sel && !_exporting) _openClip(i);
+      },
+      child: Container(
+        width: width,
+        margin: const EdgeInsets.only(right: 6),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected ? Colors.amber : Colors.transparent,
+            width: 3,
+          ),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(5),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (c.thumbs.isNotEmpty)
+                Image.file(File(c.thumbs.first), fit: BoxFit.cover)
+              else
+                const ColoredBox(color: Color(0xFF1E1E28)),
+              Positioned(
+                left: 4,
+                bottom: 2,
+                child: Text(
+                  '${i + 1}  ${_fmt(c.outSeconds)}'
+                  '${c.speed != 1.0 ? '  ${c.speed}x' : ''}',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    shadows: [Shadow(blurRadius: 4, color: Colors.black)],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -358,9 +584,10 @@ class _EditorScreenState extends State<EditorScreen> {
       final active = _tool == t;
       final color =
           active ? Theme.of(context).colorScheme.primary : Colors.white60;
-      return Expanded(
-        child: InkWell(
-          onTap: () => setState(() => _tool = t),
+      return InkWell(
+        onTap: () => setState(() => _tool = t),
+        child: SizedBox(
+          width: 68,
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 10),
             child: Column(
@@ -378,21 +605,27 @@ class _EditorScreenState extends State<EditorScreen> {
 
     return Container(
       color: const Color(0xFF0B0B0F),
-      child: Row(
-        children: [
-          item(Tool.trim, Icons.content_cut, 'Trim'),
-          item(Tool.speed, Icons.speed, 'Speed'),
-          item(Tool.filters, Icons.auto_awesome, 'Filters'),
-          item(Tool.text, Icons.title, 'Text'),
-          item(Tool.overlay, Icons.layers, 'Overlay'),
-          item(Tool.music, Icons.music_note, 'Music'),
-        ],
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            item(Tool.clip, Icons.video_library_outlined, 'Clip'),
+            item(Tool.trim, Icons.content_cut, 'Trim'),
+            item(Tool.speed, Icons.speed, 'Speed'),
+            item(Tool.filters, Icons.auto_awesome, 'Filters'),
+            item(Tool.text, Icons.title, 'Text'),
+            item(Tool.overlay, Icons.layers, 'Overlay'),
+            item(Tool.music, Icons.music_note, 'Music'),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildPanel() {
     switch (_tool) {
+      case Tool.clip:
+        return _clipPanel();
       case Tool.trim:
         return _trimPanel();
       case Tool.speed:
@@ -408,31 +641,86 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
 
-  Widget _trimPanel() {
-    final pos = _c.value.position.inMilliseconds / 1000.0;
+  Widget _clipPanel() {
+    final c = _clip;
+    final pos = _pos.clamp(c.start, c.end);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Trim', style: TextStyle(fontWeight: FontWeight.w700)),
+        Text(
+          'Clip ${_sel + 1} of ${s.clips.length}',
+          style: const TextStyle(fontWeight: FontWeight.w700),
+        ),
+        Row(
+          children: [
+            const Icon(Icons.linear_scale, size: 20),
+            Expanded(
+              child: Slider(
+                value: pos,
+                min: c.start,
+                max: c.end,
+                onChangeStart: (_) => _c?.pause(),
+                onChanged: _ready ? (v) => _seekTo(v) : null,
+              ),
+            ),
+          ],
+        ),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: [
+            FilledButton.tonalIcon(
+              onPressed: _ready ? _splitClip : null,
+              icon: const Icon(Icons.call_split),
+              label: const Text('Split'),
+            ),
+            FilledButton.tonalIcon(
+              onPressed: _exporting ? null : _deleteClip,
+              icon: const Icon(Icons.delete_outline),
+              label: const Text('Delete'),
+            ),
+            IconButton.filledTonal(
+              onPressed: _sel > 0 ? () => _moveClip(-1) : null,
+              icon: const Icon(Icons.arrow_back),
+            ),
+            IconButton.filledTonal(
+              onPressed: _sel < s.clips.length - 1 ? () => _moveClip(1) : null,
+              icon: const Icon(Icons.arrow_forward),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _trimPanel() {
+    final c = _clip;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Trim clip ${_sel + 1}',
+          style: const TextStyle(fontWeight: FontWeight.w700),
+        ),
         const SizedBox(height: 10),
         TrimBar(
-          thumbs: _thumbs,
-          duration: _duration,
-          start: s.start,
-          end: s.end,
-          position: pos,
+          thumbs: c.thumbs,
+          duration: c.duration,
+          start: c.start,
+          end: c.end,
+          position: _pos,
           onChanged: (a, b) => setState(() {
-            s.start = a;
-            s.end = b;
+            c.start = a;
+            c.end = b;
           }),
-          onChangeEnd: () => _seekTo(s.start),
+          onChangeEnd: () => _seekTo(c.start),
         ),
         const SizedBox(height: 8),
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text('Start ${_fmt(s.start)}'),
-            Text('End ${_fmt(s.end)}'),
+            Text('Start ${_fmt(c.start)}'),
+            Text('End ${_fmt(c.end)}'),
           ],
         ),
       ],
@@ -440,10 +728,14 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   Widget _speedPanel() {
+    final c = _clip;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Speed', style: TextStyle(fontWeight: FontWeight.w700)),
+        Text(
+          'Speed of clip ${_sel + 1}',
+          style: const TextStyle(fontWeight: FontWeight.w700),
+        ),
         const SizedBox(height: 12),
         Wrap(
           spacing: 10,
@@ -451,10 +743,10 @@ class _EditorScreenState extends State<EditorScreen> {
             for (final v in kSpeeds)
               ChoiceChip(
                 label: Text('${v}x'),
-                selected: s.speed == v,
+                selected: c.speed == v,
                 onSelected: (_) {
-                  setState(() => s.speed = v);
-                  _c.setPlaybackSpeed(v);
+                  setState(() => c.speed = v);
+                  _c?.setPlaybackSpeed(v);
                 },
               ),
           ],
@@ -467,7 +759,10 @@ class _EditorScreenState extends State<EditorScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Filters', style: TextStyle(fontWeight: FontWeight.w700)),
+        const Text(
+          'Filters (whole video)',
+          style: TextStyle(fontWeight: FontWeight.w700),
+        ),
         const SizedBox(height: 12),
         Wrap(
           spacing: 10,
@@ -503,7 +798,8 @@ class _EditorScreenState extends State<EditorScreen> {
         ),
         const SizedBox(height: 6),
         const Text(
-          'Drag the text on the video to move it. Pinch to resize.',
+          'Drag the text on the video to move it. Pinch to resize. '
+          'It shows for the whole video.',
           style: TextStyle(color: Colors.white54, fontSize: 12),
         ),
         const SizedBox(height: 10),

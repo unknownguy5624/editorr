@@ -108,6 +108,43 @@ const List<String> kTextSizeLabels = ['S', 'M', 'L'];
 
 const List<double> kSpeeds = [0.5, 1.0, 1.5, 2.0];
 
+/// One piece of video on the timeline.
+class ClipItem {
+  final String path;
+  final double duration; // full source length, seconds
+  final double width;
+  final double height;
+  double start; // trim start inside the source, seconds
+  double end; // trim end inside the source, seconds
+  double speed = 1.0;
+  List<String> thumbs = [];
+
+  ClipItem({
+    required this.path,
+    required this.duration,
+    required this.width,
+    required this.height,
+  })  : start = 0,
+        end = duration;
+
+  ClipItem copy() {
+    final c = ClipItem(
+      path: path,
+      duration: duration,
+      width: width,
+      height: height,
+    );
+    c.start = start;
+    c.end = end;
+    c.speed = speed;
+    c.thumbs = thumbs;
+    return c;
+  }
+
+  /// Length of this clip in the finished video.
+  double get outSeconds => (end - start) / speed;
+}
+
 /// An image placed on top of the video. Position is the CENTRE of the
 /// image as a fraction of the video (0..1); width is a fraction of video width.
 class OverlayItem {
@@ -120,11 +157,8 @@ class OverlayItem {
 
 /// Everything the user has chosen in the editor.
 class EditSettings {
-  double start = 0; // seconds
-  double end = 0; // seconds
-  double speed = 1.0;
+  final List<ClipItem> clips = [];
   FilterPreset filter = kFilters.first;
-  double videoHeight = 1080; // pixels, used to size the text box
 
   String text = '';
   double textX = 0.5; // centre, fraction of video width
@@ -139,5 +173,5 @@ class EditSettings {
   double musicVolume = 1.0;
 
   bool get hasText => text.trim().isNotEmpty;
-  double get outputSeconds => (end - start) / speed;
+  double get outputSeconds => clips.fold(0.0, (a, c) => a + c.outSeconds);
 }
