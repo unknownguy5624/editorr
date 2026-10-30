@@ -6,13 +6,14 @@ import 'package:image_picker/image_picker.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/ad_service.dart';
+import '../services/cutout_service.dart';
 import '../services/edit_settings.dart';
 import '../services/export_service.dart';
 import '../services/project_store.dart';
 import 'export_screen.dart';
 import 'trim_bar.dart';
 
-enum Tool { clip, trim, speed, filters, text, overlay, music }
+enum Tool { clip, trim, speed, cutout, filters, text, overlay, music }
 
 class EditorScreen extends StatefulWidget {
   final String videoPath;
@@ -35,6 +36,15 @@ class _EditorScreenState extends State<EditorScreen> {
   double _progress = 0;
   double _baseSize = 0.3; // size at the start of a pinch gesture
   bool _failedToLoad = false;
+
+  // background removal
+  CutoutBackground _cutBg = CutoutBackground.blur;
+  String? _cutBgImage;
+  bool _cutting = false;
+  double _cutProgress = 0;
+  String _cutLabel = '';
+
+  bool get _busy => _exporting || _cutting;
 
   ClipItem get _clip => s.clips[_sel];
 
@@ -257,6 +267,70 @@ class _EditorScreenState extends State<EditorScreen> {
     });
   }
 
+  // ------------------------------------------------------ background removal
+
+  Future<void> _pickCutBgImage() async {
+    final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+    if (picked == null) return;
+    setState(() {
+      _cutBgImage = picked.path;
+      _cutBg = CutoutBackground.image;
+    });
+  }
+
+  Future<void> _runCutout() async {
+    if (!_ready || _busy) return;
+    await _c?.pause();
+    if (!mounted) return;
+    setState(() {
+      _cutting = true;
+      _cutProgress = 0;
+      _cutLabel = 'Starting';
+    });
+
+    final r = await CutoutService.removeBackground(
+      clip: _clip,
+      bg: _cutBg,
+      bgImagePath: _cutBgImage,
+      onProgress: (label, p) {
+        if (mounted) {
+          setState(() {
+            _cutLabel = label;
+            _cutProgress = p;
+          });
+        }
+      },
+    );
+
+    if (!mounted) return;
+    setState(() => _cutting = false);
+
+    final newClip = r.clip;
+    if (newClip == null) {
+      showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Background removal failed'),
+          content: SingleChildScrollView(
+            child: Text(r.error ?? 'Unknown error'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    s.clips[_sel] = newClip;
+    _loadThumbs(newClip);
+    await _openClip(_sel);
+    _toast('Background removed');
+  }
+
   // --------------------------------------------------------- export
 
   Future<void> _export() async {
@@ -315,7 +389,7 @@ class _EditorScreenState extends State<EditorScreen> {
   Widget build(BuildContext context) {
     final loaded = s.clips.isNotEmpty;
     return PopScope(
-      canPop: !_exporting,
+      canPop: !_busy,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Editor'),
@@ -323,7 +397,7 @@ class _EditorScreenState extends State<EditorScreen> {
             Padding(
               padding: const EdgeInsets.only(right: 12),
               child: FilledButton(
-                onPressed: (loaded && _ready && !_exporting) ? _export : null,
+                onPressed: (loaded && _ready && !_busy) ? _export : null,
                 child: const Text('Export'),
               ),
             ),
@@ -358,7 +432,7 @@ class _EditorScreenState extends State<EditorScreen> {
                     _buildToolBar(),
                   ],
                 ),
-              if (_exporting) _buildExportOverlay(),
+              if (_busy) _buildBusyOverlay(),
             ],
           ),
         ),
@@ -514,7 +588,7 @@ class _EditorScreenState extends State<EditorScreen> {
         children: [
           for (var i = 0; i < s.clips.length; i++) _clipBlock(i),
           InkWell(
-            onTap: _exporting ? null : _addClip,
+            onTap: _busy ? null : _addClip,
             borderRadius: BorderRadius.circular(8),
             child: Container(
               width: 56,
@@ -537,7 +611,7 @@ class _EditorScreenState extends State<EditorScreen> {
     final width = (c.outSeconds * 22).clamp(70.0, 260.0);
     return GestureDetector(
       onTap: () {
-        if (i != _sel && !_exporting) _openClip(i);
+        if (i != _sel && !_busy) _openClip(i);
       },
       child: Container(
         width: width,
@@ -612,6 +686,7 @@ class _EditorScreenState extends State<EditorScreen> {
             item(Tool.clip, Icons.video_library_outlined, 'Clip'),
             item(Tool.trim, Icons.content_cut, 'Trim'),
             item(Tool.speed, Icons.speed, 'Speed'),
+            item(Tool.cutout, Icons.person_outline, 'Cutout'),
             item(Tool.filters, Icons.auto_awesome, 'Filters'),
             item(Tool.text, Icons.title, 'Text'),
             item(Tool.overlay, Icons.layers, 'Overlay'),
@@ -630,6 +705,8 @@ class _EditorScreenState extends State<EditorScreen> {
         return _trimPanel();
       case Tool.speed:
         return _speedPanel();
+      case Tool.cutout:
+        return _cutoutPanel();
       case Tool.filters:
         return _filterPanel();
       case Tool.text:
@@ -675,7 +752,7 @@ class _EditorScreenState extends State<EditorScreen> {
               label: const Text('Split'),
             ),
             FilledButton.tonalIcon(
-              onPressed: _exporting ? null : _deleteClip,
+              onPressed: _busy ? null : _deleteClip,
               icon: const Icon(Icons.delete_outline),
               label: const Text('Delete'),
             ),
@@ -688,6 +765,70 @@ class _EditorScreenState extends State<EditorScreen> {
               icon: const Icon(Icons.arrow_forward),
             ),
           ],
+        ),
+      ],
+    );
+  }
+
+  Widget _cutoutPanel() {
+    final c = _clip;
+    final len = c.end - c.start;
+    final tooLong = len > CutoutService.maxSeconds + 0.01;
+    const labels = {
+      CutoutBackground.blur: 'Blur',
+      CutoutBackground.black: 'Black',
+      CutoutBackground.white: 'White',
+      CutoutBackground.green: 'Green',
+      CutoutBackground.image: 'Image',
+    };
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Remove background of clip ${_sel + 1}',
+          style: const TextStyle(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: [
+            for (final e in labels.entries)
+              ChoiceChip(
+                label: Text(e.value),
+                selected: _cutBg == e.key,
+                onSelected: (_) {
+                  if (e.key == CutoutBackground.image && _cutBgImage == null) {
+                    _pickCutBgImage();
+                  } else {
+                    setState(() => _cutBg = e.key);
+                  }
+                },
+              ),
+          ],
+        ),
+        if (_cutBg == CutoutBackground.image)
+          TextButton.icon(
+            onPressed: _pickCutBgImage,
+            icon: const Icon(Icons.image_outlined),
+            label: Text(
+              _cutBgImage == null ? 'Pick background image' : 'Change image',
+            ),
+          ),
+        const SizedBox(height: 4),
+        FilledButton.icon(
+          onPressed: (_ready && !_busy && !tooLong) ? _runCutout : null,
+          icon: const Icon(Icons.person_outline),
+          label: const Text('Remove background'),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          tooLong
+              ? 'This clip is ${len.toStringAsFixed(0)}s. Trim it to '
+                  '${CutoutService.maxSeconds.toInt()}s or less first.'
+              : 'Works on people. Takes a little while. Replaces this clip '
+                  'with the cut-out version.',
+          style: const TextStyle(color: Colors.white54, fontSize: 12),
         ),
       ],
     );
@@ -952,7 +1093,9 @@ class _EditorScreenState extends State<EditorScreen> {
     );
   }
 
-  Widget _buildExportOverlay() {
+  Widget _buildBusyOverlay() {
+    final title = _exporting ? 'Exporting' : _cutLabel;
+    final p = _exporting ? _progress : _cutProgress;
     return Positioned.fill(
       child: AbsorbPointer(
         child: Container(
@@ -965,15 +1108,13 @@ class _EditorScreenState extends State<EditorScreen> {
                   width: 90,
                   height: 90,
                   child: CircularProgressIndicator(
-                    value: _progress > 0 ? _progress : null,
+                    value: p > 0 ? p : null,
                     strokeWidth: 6,
                   ),
                 ),
                 const SizedBox(height: 18),
                 Text(
-                  _progress > 0
-                      ? 'Exporting ${(_progress * 100).round()}%'
-                      : 'Exporting...',
+                  p > 0 ? '$title ${(p * 100).round()}%' : '$title...',
                   style: const TextStyle(fontSize: 16),
                 ),
                 const SizedBox(height: 6),

@@ -18,6 +18,8 @@ dependencies:
   share_plus: ^10.0.0
   google_mobile_ads: ^9.0.0
   ffmpeg_kit_flutter_new: ^4.1.0
+  google_mlkit_commons: any
+  google_mlkit_selfie_segmentation: any
 
 flutter:
   uses-material-design: true
